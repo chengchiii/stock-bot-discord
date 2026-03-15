@@ -6,13 +6,14 @@ import asyncio
 import json
 import requests
 from datetime import datetime, timedelta
+import traceback
 import matplotlib
 matplotlib.use('Agg') 
 import matplotlib.pyplot as plt
 from flask import Flask
 from threading import Thread
 
-# --- Render 存活檢查 (維持不變) ---
+# --- Render 存活檢查 ---
 app = Flask('')
 @app.route('/')
 def home(): return "Quant Bot 4.0: FinMind Data Engine Online!"
@@ -20,7 +21,7 @@ def run(): app.run(host='0.0.0.0', port=10000)
 def keep_alive(): Thread(target=run).start()
 
 # ==========================================
-# 1. 系統設定與環境變數
+# 1. 系統設定
 # ==========================================
 DISCORD_BOT_TOKEN = os.environ.get("DISCORD_BOT_TOKEN")
 CHANNEL_ID = os.environ.get("CHANNEL_ID")
@@ -31,9 +32,6 @@ intents = discord.Intents.default()
 intents.message_content = True
 bot = commands.Bot(command_prefix='!', intents=intents)
 
-# ==========================================
-# 2. 核心 50 檔旗艦觀察名單
-# ==========================================
 STOCK_NAMES = {
     "2330.TW": "台積電", "2454.TW": "聯發科", "2303.TW": "聯電", "3711.TW": "日月光投控",
     "2379.TW": "瑞昱", "3008.TW": "大立光", "3034.TW": "聯詠", "2308.TW": "台達電",
@@ -53,7 +51,7 @@ WATCHLIST = list(STOCK_NAMES.keys())
 REVERSE_STOCK_NAMES = {v: k for k, v in STOCK_NAMES.items()}
 
 # ==========================================
-# 3. 虛擬帳本系統
+# 2. 虛擬帳本系統
 # ==========================================
 PORTFOLIO_FILE = "portfolio.json"
 
@@ -68,13 +66,42 @@ def save_portfolio(p):
     with open(PORTFOLIO_FILE, "w") as f: json.dump(p, f, indent=4)
 
 # ==========================================
-# 4. MACD + 200 EMA 策略邏輯與繪圖
+# 3. FinMind 數據引擎
+# ==========================================
+def get_finmind_data(symbol):
+    stock_id = symbol.replace('.TW', '')
+    if stock_id == '^TWII': stock_id = 'TAIEX'
+    start_date = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
+    url = "https://api.finmindtrade.com/api/v4/data"
+    params = {"dataset": "TaiwanStockPrice", "data_id": stock_id, "start_date": start_date}
+    try:
+        res = requests.get(url, params=params, timeout=10)
+        data = res.json()
+        if data.get("msg") == "success" and len(data.get("data", [])) > 0:
+            df = pd.DataFrame(data["data"])
+            df['date'] = pd.to_datetime(df['date'])
+            df.set_index('date', inplace=True)
+            df.rename(columns={'close': 'Close'}, inplace=True)
+            return df
+    except Exception as e:
+        print(f"FinMind API 錯誤 ({stock_id}): {e}")
+    return pd.DataFrame()
+
+async def fetch_single_stock_data(symbol, retries=2):
+    loop = asyncio.get_running_loop()
+    for attempt in range(retries):
+        df = await loop.run_in_executor(None, get_finmind_data, symbol)
+        if not df.empty and len(df) > 0: return symbol, df
+        await asyncio.sleep(1)
+    return symbol, pd.DataFrame()
+
+# ==========================================
+# 4. 專業圖表繪製 (MACD + EMA)
 # ==========================================
 def generate_advanced_chart(df, symbol):
     plt.figure(figsize=(12, 8))
     plt.rcParams['font.family'] = 'DejaVu Sans'
     
-    # 主圖：Price & 200 EMA
     ax1 = plt.subplot(2, 1, 1)
     ema200 = df['Close'].ewm(span=200, adjust=False).mean()
     plt.plot(df.index, df['Close'], label='Price', color='blue', alpha=0.6)
@@ -83,12 +110,9 @@ def generate_advanced_chart(df, symbol):
     plt.legend()
     plt.grid(True, alpha=0.3)
 
-    # 副圖：MACD
     ax2 = plt.subplot(2, 1, 2, sharex=ax1)
-    exp1 = df['Close'].ewm(span=12).mean()
-    exp2 = df['Close'].ewm(span=26).mean()
-    macd = exp1 - exp2
-    sig = macd.ewm(span=9).mean()
+    macd = df['Close'].ewm(span=12, adjust=False).mean() - df['Close'].ewm(span=26, adjust=False).mean()
+    sig = macd.ewm(span=9, adjust=False).mean()
     hist = macd - sig
     
     plt.plot(df.index, macd, label='MACD', color='blue')
@@ -104,58 +128,20 @@ def generate_advanced_chart(df, symbol):
     return chart_path
 
 # ==========================================
-# 5. 智慧指令監聽
+# 5. 單股分析與倉位健檢 (你最需要的功能！)
 # ==========================================
-@bot.event
-async def on_message(message):
-    if message.author == bot.user: return
-    content = message.content.strip()
-
-    if content in ["我的庫存", "庫存", "帳本"]:
-        await show_portfolio(message.channel)
-        return
-
-    if content in ["全面掃描", "大盤", "投資組合"]:
-        await message.channel.send("🚀 啟動 200 EMA + MACD 全市場策略掃描...")
-        await perform_scan(force_send=True)
-        return
-
-    target_symbol = None
-    if content in REVERSE_STOCK_NAMES: target_symbol = REVERSE_STOCK_NAMES[content]
-    elif content.isdigit() and len(content) == 4: target_symbol = content + ".TW"
-    elif content.endswith(".TW"): target_symbol = content
-
-    if target_symbol:
-        await process_stock_query(message.channel, target_symbol)
-
-    await bot.process_commands(message)
-
-# ==========================================
-# 6. 核心分析與交易引擎
-# ==========================================
-import traceback # 記得在最上面加上這行 (跟 import os 放一起)
-
 async def process_stock_query(channel, symbol):
-    # 發送初步確認訊息
     initial_msg = await channel.send(f"🔍 正在對 `{symbol}` 進行深度高勝率策略分析與倉位精算...")
-    
     try:
-        # 1. 獲取資料
-        print(f"DEBUG: 準備呼叫 fetch_single_stock_data 抓取 {symbol}")
         _, df = await fetch_single_stock_data(symbol)
-        
-        print(f"DEBUG: fetch_single_stock_data 回傳結果，df 長度: {len(df)}")
         if df.empty or len(df) < 200:
-            await initial_msg.edit(content=f"❌ `{symbol}` 歷史數據不足（需至少 200 天，目前取得 {len(df)} 天）或 API 暫時無回應。")
+            await initial_msg.edit(content=f"❌ `{symbol}` 歷史數據不足（需至少 200 天）或 API 暫時無回應。")
             return
             
-        # 2. 讀取虛擬帳本
         p = load_portfolio()
         cash = p.get("cash", 0.0)
         holdings = p.get("holdings", {})
             
-        # 3. 計算技術指標
-        print("DEBUG: 開始計算技術指標")
         close = df['Close']
         ema200 = close.ewm(span=200, adjust=False).mean()
         macd = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
@@ -166,15 +152,11 @@ async def process_stock_query(channel, symbol):
         curr_macd = macd.iloc[-1]
         curr_sig = sig.iloc[-1]
 
-        # 4. 策略判斷
         trend = "上升趨勢" if curr_p > curr_ema200 else "下降趨勢"
         is_long = (curr_p > curr_ema200) and (macd.iloc[-2] < sig.iloc[-2]) and (curr_macd > curr_sig) and (curr_macd < 0)
         
-        # 5. 畫圖 
-        print("DEBUG: 開始畫圖")
         chart_path = generate_advanced_chart(df, symbol)
         
-        # 6. 組合報告
         msg = (
             f"📊 **{STOCK_NAMES.get(symbol, symbol)} ({symbol}) 策略與倉位報告**\n"
             f"> 1. 【趨勢】：目前處於 **{trend}** (現價 `{curr_p:.1f}` vs 200 EMA `{curr_ema200:.1f}`)\n"
@@ -187,21 +169,19 @@ async def process_stock_query(channel, symbol):
             tp = curr_p + (curr_p - sl) * 1.5
             msg += f"> 4. 【風險設置】：停損防線 `{sl:.1f}`，停利目標 `{tp:.1f}` (R/R 1:1.5)\n"
 
-        # 7. 智慧倉位分析 
         msg += "\n💼 **【專屬帳戶健檢】**\n"
         if symbol in holdings:
             data_p = holdings[symbol]
             shares = data_p["shares"]
             avg_cost = data_p["avg_cost"]
             profit_pct = ((curr_p - avg_cost) / avg_cost) * 100
-            
             msg += f"> 📦 庫存狀態：目前持有 `{shares}` 股 | 平均成本 `{avg_cost:.1f}` | 帳面報酬 **`{profit_pct:.1f}%`**\n"
             
             high_p = data_p.get("high_price", curr_p)
             if curr_p < curr_ema200 or curr_p < high_p * 0.85:
                 msg += "> 🚨 **賣出警告**：已跌破 200 EMA 或從高點回落 15%，建議**立刻平倉賣出**！\n"
             else:
-                msg += "> 🛡️ **持股建議**：目前趨勢健康，尚未觸發停利損，建議**繼續抱牢**。\n"
+                msg += "> 🛡️ **持股建議**：目前趨勢健康，尚未觸發停損利條件，建議**繼續抱牢**。\n"
         else:
             if is_long:
                 max_shares = int(cash // curr_p)
@@ -212,73 +192,17 @@ async def process_stock_query(channel, symbol):
             else:
                  msg += "> 📭 庫存狀態：目前未持有此檔股票。\n"
 
-        # 傳送圖片與報告 (先刪除一開始的等待訊息)
         await initial_msg.delete()
         with open(chart_path, 'rb') as f:
             await channel.send(content=msg, file=discord.File(f))
         os.remove(chart_path)
-        
     except Exception as e:
-        # 如果發生任何錯誤，把錯誤的詳細原因 (Traceback) 傳到頻道裡
         error_msg = traceback.format_exc()
         await initial_msg.edit(content=f"❌ 系統發生嚴重錯誤！\n```python\n{error_msg}\n```")
-        print(f"ERROR in process_stock_query:\n{error_msg}")
+
 # ==========================================
-# 7. 全自動巡邏引擎 (包含 15% 移動停利)
+# 6. 大盤自動掃描引擎
 # ==========================================
-import concurrent.futures
-
-# ... (其他程式碼保持不變) ...
-
-def get_finmind_data(symbol):
-    """
-    透過 FinMind API 獲取台股過去一年的歷史資料，並轉換成相容的格式
-    """
-    # 1. 處理代號轉換 (把 2330.TW 變成 2330，把 ^TWII 變成 TAIEX)
-    stock_id = symbol.replace('.TW', '')
-    if stock_id == '^TWII': 
-        stock_id = 'TAIEX'
-
-    # 2. 設定抓取時間 (過去 365 天)
-    start_date = (datetime.now() - timedelta(days=365)).strftime('%Y-%m-%d')
-    url = "https://api.finmindtrade.com/api/v4/data"
-    params = {
-        "dataset": "TaiwanStockPrice",
-        "data_id": stock_id,
-        "start_date": start_date
-    }
-
-    try:
-        res = requests.get(url, params=params, timeout=10)
-        data = res.json()
-        
-        # 3. 如果成功抓到資料，轉換成原本程式看得懂的格式 (DataFrame)
-        if data.get("msg") == "success" and len(data.get("data", [])) > 0:
-            df = pd.DataFrame(data["data"])
-            df['date'] = pd.to_datetime(df['date'])
-            df.set_index('date', inplace=True)
-            df.rename(columns={'close': 'Close'}, inplace=True) # 把小寫 close 換成大寫 Close
-            return df
-    except Exception as e:
-        print(f"FinMind API 錯誤 ({stock_id}): {e}")
-        
-    return pd.DataFrame() # 失敗回傳空資料
-
-async def fetch_single_stock_data(symbol, retries=2):
-    """
-    非同步包裝，避免卡住 Discord 機器人
-    """
-    loop = asyncio.get_running_loop()
-    for attempt in range(retries):
-        df = await loop.run_in_executor(None, get_finmind_data, symbol)
-        
-        if not df.empty and len(df) > 0:
-            return symbol, df
-            
-        await asyncio.sleep(1) # 抓不到就休息一秒再試
-        
-    return symbol, pd.DataFrame()
-
 async def perform_scan(force_send=False):
     channel = bot.get_channel(int(CHANNEL_ID))
     if not channel: return
@@ -286,23 +210,20 @@ async def perform_scan(force_send=False):
     p = load_portfolio()
     msg_lines = []
     
-    # 1. 處理入金
     curr_month = datetime.now().strftime("%Y-%m")
     if p.get("last_month", "") != curr_month:
         p["cash"] = p.get("cash", 0.0) + INVEST_AMOUNT
         p["last_month"] = curr_month
         msg_lines.append(f"🏦 **入金成功**：帳戶已存入 {INVEST_AMOUNT} 元，可用現金：`{p['cash']:.0f}`")
 
-    # 2. 判斷大盤 (雙重保險：先看大盤指數，抓不到再看 0050)
     _, df_market = await fetch_single_stock_data("^TWII")
     market_name = "加權指數 (^TWII)"
-    
     if df_market.empty:
         _, df_market = await fetch_single_stock_data("0050.TW")
         market_name = "台灣 50 (0050)"
 
     if df_market.empty:
-        msg_lines.append("⚠️ 警告：Yahoo API 異常，大盤與 0050 皆無法取得數據！保護機制啟動，暫停買進。")
+        msg_lines.append("⚠️ 警告：API 異常，大盤皆無法取得數據！保護機制啟動，暫停買進。")
         is_bull_market = False
     else:
         ma60_market = df_market['Close'].tail(60).mean()
@@ -310,44 +231,33 @@ async def perform_scan(force_send=False):
         if not is_bull_market:
             msg_lines.append(f"🛑 **【大盤警報】** {market_name} 目前位於季線之下。空頭市場嚴禁做多，維持觀望！")
 
-    # 3. 如果大盤是多頭，開始掃描 50 檔
     results = []
     if is_bull_market:
-        scan_msg = await channel.send(f"✅ 大盤 ({market_name}) 確認偏多！正在逐檔掃描 50 檔成分股的 MACD 狀態，約需 30~60 秒...")
-        
+        scan_msg = await channel.send(f"✅ 大盤 ({market_name}) 確認偏多！正在逐檔掃描 50 檔成分股...")
         for s in WATCHLIST:
             _, df = await fetch_single_stock_data(s)
-            if df.empty or len(df) < 200: 
-                await asyncio.sleep(0.5)
-                continue
+            if df.empty or len(df) < 200: continue
             
             close = df['Close']
             ema200 = close.ewm(span=200, adjust=False).mean()
             macd = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
             sig = macd.ewm(span=9, adjust=False).mean()
             
-            # 策略：站上 200EMA + 零軸下金叉
             if (close.iloc[-1] > ema200.iloc[-1]) and (macd.iloc[-2] < sig.iloc[-2]) and (macd.iloc[-1] > sig.iloc[-1]) and (macd.iloc[-1] < 0):
                 results.append({'symbol': s, 'price': close.iloc[-1], 'score': macd.iloc[-1] - sig.iloc[-1]})
-            
-            await asyncio.sleep(0.5) # 乖乖排隊不塞車
-        
+            await asyncio.sleep(0.5)
         try:
             await scan_msg.delete()
         except: pass
-
         if not results:
-            msg_lines.append("🔎 **【掃描結果】** 巡邏了 50 檔旗艦股，目前 **無任何一檔** 發生「零軸下 MACD 黃金交叉」。策略嚴格執行，不胡亂追高！")
+            msg_lines.append("🔎 **【掃描結果】** 巡邏了 50 檔旗艦股，目前 **無任何一檔** 符合 MACD 買進訊號。策略嚴格執行，不胡亂追高！")
 
-    # 4. 檢查現有持股 (移動停利)
     for sym, data_p in list(p.get("holdings", {}).items()):
         _, df = await fetch_single_stock_data(sym)
         if df.empty: continue
-        
         curr_p = df['Close'].iloc[-1]
         ema200 = df['Close'].ewm(span=200, adjust=False).mean().iloc[-1]
         if curr_p > data_p["high_price"]: data_p["high_price"] = curr_p
-            
         if curr_p < ema200 or curr_p < data_p["high_price"] * 0.85:
             sell_val = data_p["shares"] * curr_p
             profit_pct = ((curr_p - data_p["avg_cost"]) / data_p["avg_cost"]) * 100
@@ -356,7 +266,6 @@ async def perform_scan(force_send=False):
             msg_lines.append(f"🚨 **自動平倉**：{name} 觸發保護機制。賣出價 `{curr_p:.1f}` (報酬率 `{profit_pct:.1f}%`)")
             del p["holdings"][sym]
 
-    # 5. 執行買進
     results.sort(key=lambda x: x['score'], reverse=True)
     if results and p.get("cash", 0) > 1000:
         targets = results[:2]
@@ -375,19 +284,46 @@ async def perform_scan(force_send=False):
     if force_send or msg_lines:
         final_msg = "🛰️ **【量化艦隊執行報告】**\n" + "\n".join(msg_lines)
         await channel.send(final_msg[:2000])
+
 async def show_portfolio(channel):
     p = load_portfolio()
-    msg = f"💼 **帳本狀態**\n現金：`{p['cash']:.0f}` 元\n"
-    for s, d in p["holdings"].items():
-        msg += f"🔸 {STOCK_NAMES.get(s, s)}: `{d['shares']}`股 (均價:{d['avg_cost']:.1f})\n"
+    msg = f"💼 **帳戶總覽**\n💵 **可用現金：** `{p.get('cash', 0):.0f}` 元\n"
+    if not p.get("holdings"):
+        msg += "📭 目前空手觀望中。"
+    else:
+        msg += "📦 **當前持股：**\n"
+        for sym, d in p["holdings"].items():
+            msg += f"🔸 {STOCK_NAMES.get(sym, sym)}: `{d['shares']}`股 (成本:`{d['avg_cost']:.1f}`)\n"
     await channel.send(msg)
 
-has_run_scan = False
+# ==========================================
+# 7. 智慧指令路由
+# ==========================================
+@bot.event
+async def on_message(message):
+    if message.author == bot.user: return
+    content = message.content.strip()
+
+    if content in ["我的庫存", "庫存", "帳本"]:
+        await show_portfolio(message.channel)
+        return
+    if content in ["全面掃描", "大盤", "投資組合"]:
+        await message.channel.send("🚀 啟動 200 EMA + MACD 全市場策略掃描...")
+        await perform_scan(force_send=True)
+        return
+
+    target_symbol = None
+    if content in REVERSE_STOCK_NAMES: target_symbol = REVERSE_STOCK_NAMES[content]
+    elif content.isdigit() and len(content) == 4: target_symbol = content + ".TW"
+    elif content.endswith(".TW"): target_symbol = content
+
+    if target_symbol:
+        await process_stock_query(message.channel, target_symbol)
+
+    await bot.process_commands(message)
+
 @bot.event
 async def on_ready():
-    global has_run_scan
-    if has_run_scan: return
-    has_run_scan = True
     print(f"🤖 Bot Online: {bot.user}")
     keep_alive()
     if RUN_MODE == "github_cron":
